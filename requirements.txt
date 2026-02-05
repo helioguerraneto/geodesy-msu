@@ -1,0 +1,8 @@
+dash==2.14.2
+plotly==5.18.0
+pandas==2.1.4
+numpy==1.26.2
+scipy==1.11.4
+pyproj==3.6.1
+requests==2.31.0
+gunicorn==21.2.0
