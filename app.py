@@ -275,26 +275,78 @@ server = app.server
 # ============================================================
 # MAP
 # ============================================================
-def make_map(show_labels=False):
+def make_map(show_labels=False, zoomed_station=None):
+    """
+    Cria o mapa com opções de zoom.
+    
+    Args:
+        show_labels: mostra os IDs das estações
+        zoomed_station: ID da estação para dar zoom (None para visão geral)
+    """
     fig = go.Figure()
+    
+    # Adiciona todas as estações
     fig.add_scattermapbox(
         lon=stations.lon,
         lat=stations.lat,
         customdata=stations.id,
         text=stations.id if show_labels else None,
         mode="markers+text" if show_labels else "markers",
-        marker=dict(size=8, color="crimson"),
-        hovertemplate="Station: %{customdata}<extra></extra>"
+        marker=dict(
+            size=8, 
+            color="crimson",
+            opacity=0.7
+        ),
+        hovertemplate="Station: %{customdata}<extra></extra>",
+        name="All Stations"
     )
+    
+    # Configuração inicial do mapa
+    if zoomed_station is not None:
+        # Encontra a estação específica
+        station_info = stations[stations["id"] == zoomed_station]
+        if not station_info.empty:
+            station_lon = station_info["lon"].iloc[0]
+            station_lat = station_info["lat"].iloc[0]
+            
+            # Destaca a estação procurada com cor diferente
+            fig.add_scattermapbox(
+                lon=[station_lon],
+                lat=[station_lat],
+                customdata=[zoomed_station],
+                text=[zoomed_station] if show_labels else None,
+                mode="markers+text" if show_labels else "markers",
+                marker=dict(
+                    size=15,
+                    color="blue",
+                    opacity=1.0
+                ),
+                hovertemplate="<b>Selected:</b> %{customdata}<extra></extra>",
+                name="Selected Station"
+            )
+            
+            # Configura o zoom para a estação
+            map_center = dict(lon=station_lon, lat=station_lat)
+            zoom_level = 8
+        else:
+            # Se estação não encontrada, mantém visão geral
+            map_center = dict(lon=-84, lat=44)
+            zoom_level = 4.2
+    else:
+        # Visão geral de todas as estações
+        map_center = dict(lon=-84, lat=44)
+        zoom_level = 4.2
+    
     fig.update_layout(
         mapbox=dict(
             style="open-street-map",
-            center=dict(lon=-84, lat=44),
-            zoom=4.2
+            center=map_center,
+            zoom=zoom_level
         ),
         height=650,
         margin=dict(l=20, r=20, t=40, b=20)
     )
+    
     return fig
 
 # ============================================================
@@ -308,7 +360,8 @@ app.layout = html.Div(
             "station": None,
             "source": "linear",
             "view": "original",
-            "smooth": True
+            "smooth": True,
+            "zoomed_station": None
         }),
 
         html.H2("MSU Geodesy Lab - The Great Lakes GNSS Stations"),
@@ -318,8 +371,26 @@ app.layout = html.Div(
                    style={"fontSize": "12px", "color": "#666", "fontStyle": "italic"})
         ]),
 
+        html.Div([
+            html.Button("Show IDs", id="btn-labels"),
+            html.Span(" | ", style={"margin": "0 10px"}),
+            html.Label("Search ID: ", style={"marginRight": "5px"}),
+            dcc.Input(
+                id="station-search-input",
+                type="text",
+                placeholder="Enter 4-character station ID",
+                style={
+                    "width": "150px",
+                    "marginRight": "5px",
+                    "padding": "5px"
+                },
+                maxLength=4
+            ),
+            html.Button("Search", id="btn-search", n_clicks=0),
+            html.Div(id="search-status", style={"marginLeft": "10px", "display": "inline"})
+        ], style={"marginBottom": "15px"}),
+
         dcc.Graph(id="station-map", figure=make_map(), config={"scrollZoom": True}),
-        html.Button("Show IDs", id="btn-labels"),
 
         html.Hr(),
 
@@ -349,12 +420,40 @@ app.layout = html.Div(
 # CALLBACKS
 # ============================================================
 @app.callback(
-    Output("station-map", "figure"),
-    Input("btn-labels", "n_clicks")
+    [Output("station-map", "figure"),
+     Output("ui-state", "data", allow_duplicate=True),
+     Output("search-status", "children")],
+    [Input("btn-labels", "n_clicks"),
+     Input("btn-search", "n_clicks")],
+    [State("station-search-input", "value"),
+     State("ui-state", "data")],
+    prevent_initial_call=True
 )
-def toggle_station_labels(n_clicks):
-    show = (n_clicks or 0) % 2 == 1
-    return make_map(show_labels=show)
+def handle_search_and_labels(labels_clicks, search_clicks, search_input, state):
+    ctx = dash.callback_context
+    trigger = ctx.triggered[0]["prop_id"].split(".")[0]
+    
+    if trigger == "btn-labels":
+        # Alterna labels sem afetar o zoom
+        show = (labels_clicks or 0) % 2 == 1
+        return make_map(show_labels=show, zoomed_station=state.get("zoomed_station")), state, ""
+    
+    elif trigger == "btn-search":
+        if not search_input:
+            return make_map(zoomed_station=state.get("zoomed_station")), state, html.Span("Please enter a station ID", style={"color": "red"})
+        
+        search_id = search_input.strip().upper()
+        
+        # Verifica se a estação existe
+        if search_id not in stations["id"].values:
+            return make_map(zoomed_station=state.get("zoomed_station")), state, html.Span(f"Station '{search_id}' not found", style={"color": "red"})
+        
+        # Atualiza o estado para dar zoom na estação e mostrar os dados
+        new_state = state.copy()
+        new_state["station"] = search_id
+        new_state["zoomed_station"] = search_id
+        
+        return make_map(zoomed_station=search_id), new_state, html.Span(f"Showing station: {search_id}", style={"color": "green"})
 
 @app.callback(
     Output("ui-state", "data"),
@@ -377,7 +476,9 @@ def update_state(*args):
     trigger = ctx.triggered[0]["prop_id"].split(".")[0]
 
     if trigger == "station-map":
-        state["station"] = ctx.triggered[0]["value"]["points"][0]["customdata"]
+        clicked_station = ctx.triggered[0]["value"]["points"][0]["customdata"]
+        state["station"] = clicked_station
+        state["zoomed_station"] = clicked_station  # Também dá zoom ao clicar no mapa
         state["view"] = "original"
         state["smooth"] = True
     elif trigger.startswith("src-"):
@@ -403,7 +504,7 @@ def update_state(*args):
 def render_ts(state):
 
     if state["station"] is None:
-        return html.Div("Click on a station to view its time series.")
+        return html.Div("Click on a station or search for a station ID to view its time series.")
 
     try:
         df = read_pfile_from_gdrive(state["source"], state["station"])
