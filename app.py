@@ -8,9 +8,9 @@ import requests
 import numpy as np
 import pandas as pd
 from scipy.linalg import lstsq
+from scipy.ndimage import gaussian_filter1d
 from pyproj import Proj
 import re
-
 
 import dash
 from dash import dcc, html, Input, Output, State
@@ -24,6 +24,7 @@ from functools import lru_cache
 # ============================================================
 PORT = int(os.environ.get("PORT", 8050))
 MM = 1000.0
+WINDOW_SIZE = 30  # dias para a média móvel
 
 # Google Drive folder IDs extracted from share links
 GDRIVE_FOLDERS = {
@@ -226,19 +227,43 @@ def trend_and_velocity(x, t):
     m, _, _, _ = lstsq(G, x)
     return G @ m, m[1]
 
-def seasonal_model(x, t, remove_trend=False):
-    G = np.column_stack([
-        np.ones(len(t)),
-        t - t.mean(),
-        np.sin(2*np.pi*t),
-        np.cos(2*np.pi*t),
-        np.sin(4*np.pi*t),
-        np.cos(4*np.pi*t)
-    ])
-    m, _, _, _ = lstsq(G, x)
-    if remove_trend:
-        m[1] = 0.0
-    return G @ m
+def apply_smoothing(x, t, window_days=WINDOW_SIZE, sigma=1.0):
+    """
+    Aplica suavização com média móvel de janela fixa (em dias) seguida de filtro gaussiano.
+    
+    Args:
+        x: array de valores
+        t: array de tempos (em anos)
+        window_days: tamanho da janela em dias
+        sigma: parâmetro sigma para o filtro gaussiano
+    """
+    # Converte window_days para anos
+    window_years = window_days / 365.25
+    
+    # Ordena os dados por tempo
+    idx_sorted = np.argsort(t)
+    t_sorted = t[idx_sorted]
+    x_sorted = x[idx_sorted]
+    
+    # Aplica média móvel
+    x_smoothed = np.zeros_like(x_sorted)
+    
+    for i in range(len(t_sorted)):
+        # Encontra pontos dentro da janela
+        mask = np.abs(t_sorted - t_sorted[i]) <= window_years / 2
+        if np.sum(mask) > 0:
+            x_smoothed[i] = np.mean(x_sorted[mask])
+        else:
+            x_smoothed[i] = x_sorted[i]
+    
+    # Aplica filtro gaussiano
+    x_smoothed = gaussian_filter1d(x_smoothed, sigma=sigma)
+    
+    # Retorna aos índices originais
+    x_final = np.zeros_like(x)
+    x_final[idx_sorted] = x_smoothed
+    
+    return x_final
 
 # ============================================================
 # DASH APP
@@ -283,7 +308,7 @@ app.layout = html.Div(
             "station": None,
             "source": "linear",
             "view": "original",
-            "model": True
+            "smooth": True
         }),
 
         html.H2("MSU Geodesy Lab - The Great Lakes GNSS Stations"),
@@ -311,8 +336,8 @@ app.layout = html.Div(
             ], style={"marginBottom": "10px"}),
 
             html.Div([
-                html.Button("Model ON", id="btn-model-on"),
-                html.Button("Model OFF", id="btn-model-off"),
+                html.Button("Smooth ON", id="btn-smooth-on"),
+                html.Button("Smooth OFF", id="btn-smooth-off"),
             ]),
         ], style={"marginBottom": "20px"}),
 
@@ -340,8 +365,8 @@ def toggle_station_labels(n_clicks):
         Input("src-cf", "n_clicks"),
         Input("btn-original", "n_clicks"),
         Input("btn-detrended", "n_clicks"),
-        Input("btn-model-on", "n_clicks"),
-        Input("btn-model-off", "n_clicks"),
+        Input("btn-smooth-on", "n_clicks"),
+        Input("btn-smooth-off", "n_clicks"),
     ],
     State("ui-state", "data"),
     prevent_initial_call=True
@@ -354,17 +379,17 @@ def update_state(*args):
     if trigger == "station-map":
         state["station"] = ctx.triggered[0]["value"]["points"][0]["customdata"]
         state["view"] = "original"
-        state["model"] = True
+        state["smooth"] = True
     elif trigger.startswith("src-"):
         state["source"] = trigger.split("-")[1]
     elif trigger == "btn-original":
         state["view"] = "original"
     elif trigger == "btn-detrended":
         state["view"] = "detrended"
-    elif trigger == "btn-model-on":
-        state["model"] = True
-    elif trigger == "btn-model-off":
-        state["model"] = False
+    elif trigger == "btn-smooth-on":
+        state["smooth"] = True
+    elif trigger == "btn-smooth-off":
+        state["smooth"] = False
 
     return state
 
@@ -409,13 +434,11 @@ def render_ts(state):
 
         E_d, N_d, U_d = E - E_tr, N - N_tr, U - U_tr
 
-        E_m = seasonal_model(E, t)
-        N_m = seasonal_model(N, t)
-        U_m = seasonal_model(U, t)
-
-        E_md = seasonal_model(E_d, t, True)
-        N_md = seasonal_model(N_d, t, True)
-        U_md = seasonal_model(U_d, t, True)
+        # Aplica suavização se solicitado
+        if state["smooth"]:
+            E_smooth = apply_smoothing(E if state["view"] == "original" else E_d, t)
+            N_smooth = apply_smoothing(N if state["view"] == "original" else N_d, t)
+            U_smooth = apply_smoothing(U if state["view"] == "original" else U_d, t)
 
         hover = (
             "Year: %{x:.4f}<br>"
@@ -435,21 +458,32 @@ def render_ts(state):
         )
 
         use_detr = state["view"] == "detrended"
+        
+        # Dados principais
+        fig.add_scatter(x=t, y=E_d if use_detr else E, mode="markers", 
+                       hovertemplate=hover, row=1, col=1,
+                       marker=dict(size=5, opacity=0.6))
+        fig.add_scatter(x=t, y=N_d if use_detr else N, mode="markers", 
+                       hovertemplate=hover, row=2, col=1,
+                       marker=dict(size=5, opacity=0.6))
+        fig.add_scatter(x=t, y=U_d if use_detr else U, mode="markers", 
+                       hovertemplate=hover, row=3, col=1,
+                       marker=dict(size=5, opacity=0.6))
 
-        fig.add_scatter(x=t, y=E_d if use_detr else E, mode="markers", hovertemplate=hover, row=1, col=1)
-        fig.add_scatter(x=t, y=N_d if use_detr else N, mode="markers", hovertemplate=hover, row=2, col=1)
-        fig.add_scatter(x=t, y=U_d if use_detr else U, mode="markers", hovertemplate=hover, row=3, col=1)
-
-        if state["model"]:
-            fig.add_scatter(x=t, y=E_md if use_detr else E_m, mode="lines",
-                            line=dict(color="magenta"), hoverinfo="skip", row=1, col=1)
-            fig.add_scatter(x=t, y=N_md if use_detr else N_m, mode="lines",
-                            line=dict(color="magenta"), hoverinfo="skip", row=2, col=1)
-            fig.add_scatter(x=t, y=U_md if use_detr else U_m, mode="lines",
-                            line=dict(color="magenta"), hoverinfo="skip", row=3, col=1)
+        # Linha suavizada se Smooth ON
+        if state["smooth"]:
+            fig.add_scatter(x=t, y=E_smooth, mode="lines",
+                            line=dict(color="magenta", width=2), 
+                            hoverinfo="skip", row=1, col=1)
+            fig.add_scatter(x=t, y=N_smooth, mode="lines",
+                            line=dict(color="magenta", width=2), 
+                            hoverinfo="skip", row=2, col=1)
+            fig.add_scatter(x=t, y=U_smooth, mode="lines",
+                            line=dict(color="magenta", width=2), 
+                            hoverinfo="skip", row=3, col=1)
 
         fig.update_layout(
-            title=f"Station {state['station']} — {state['source'].upper()}",
+            title=f"Station {state['station']} — {state['source'].upper()} (Window: {WINDOW_SIZE} days)",
             height=900,
             showlegend=False
         )
