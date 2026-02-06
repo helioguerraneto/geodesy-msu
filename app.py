@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 from scipy.linalg import lstsq
 from pyproj import Proj
+import re
 
 import dash
 from dash import dcc, html, Input, Output, State
@@ -21,105 +22,184 @@ from plotly.subplots import make_subplots
 PORT = int(os.environ.get("PORT", 8050))
 MM = 1000.0
 
-# ID do arquivo glstations.txt no Google Drive
+# Google Drive folder IDs extracted from share links
+GDRIVE_FOLDERS = {
+    "linear": "1UQdyJahGg1gxb2WSUFs1ge9wUYUPXq93",
+    "cm": "1Xdcp8j4m4VjOwDe3ryOdNm3ge2aVqmLf",
+    "cf": "1Sc8g2GdEodO7NAeDZWkbM1MlbFNA_T5y",
+}
+
 GDRIVE_STATIONS_FILE = "17mi5FA44LvnWr-50-bLgrdbrBsuMU-bK"
 
-FILE_INDEX_PATH = "file_index.json"
-
 # ============================================================
-# GOOGLE DRIVE UTIL
+# GOOGLE DRIVE UTILITIES - IMPROVED
 # ============================================================
 def get_gdrive_download_url(file_id):
+    """Converte ID do arquivo Google Drive para URL de download direto."""
     return f"https://drive.google.com/uc?export=download&id={file_id}"
 
-# ============================================================
-# PARSE PFILES
-# ============================================================
+def get_gdrive_file_list_via_api(folder_id):
+    """
+    Tenta listar arquivos usando a API pública do Google Drive (sem auth).
+    Isso funciona para pastas públicas.
+    """
+    try:
+        # Usa a API v3 do Google Drive sem autenticação (apenas para pastas públicas)
+        # Formato: https://www.googleapis.com/drive/v3/files?q='FOLDER_ID'+in+parents&fields=files(id,name)&key=API_KEY
+        # Como não temos API key, vamos tentar uma abordagem diferente
+        
+        # Tenta acessar via web scraping melhorado
+        url = f"https://drive.google.com/embeddedfolderview?id={folder_id}"
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        
+        response = requests.get(url, headers=headers, timeout=30)
+        
+        if response.status_code != 200:
+            return {}
+        
+        # Procura por IDs de arquivo no HTML da view embutida
+        # Formato: <a href="/file/d/FILE_ID/view
+        pattern = r'/file/d/([a-zA-Z0-9_-]+)/view[^>]*>([^<]+\.pfiles)'
+        matches = re.findall(pattern, response.text)
+        
+        files = {}
+        for file_id, filename in matches:
+            station_id = filename.replace('.pfiles', '').strip()
+            files[station_id] = file_id
+            
+        if len(files) > 0:
+            print(f"Found {len(files)} files via embedded view")
+            return files
+        
+        # Tenta outro padrão
+        pattern2 = r'"([a-zA-Z0-9_-]{25,})"[^}]*?"([^"]+\.pfiles)"'
+        matches2 = re.findall(pattern2, response.text)
+        
+        for file_id, filename in matches2:
+            station_id = filename.replace('.pfiles', '').strip()
+            if station_id not in files:
+                files[station_id] = file_id
+        
+        return files
+        
+    except Exception as e:
+        print(f"Error listing folder {folder_id}: {e}")
+        return {}
+
 def parse_pfile_content(content):
+    """Parseia o conteúdo de um arquivo .pfiles."""
     rows = []
-    for line in content.splitlines():
-        if not line.strip() or line.startswith("#"):
+    for line in content.split('\n'):
+        if line.startswith("#") or not line.strip():
             continue
         p = line.split()
         if len(p) >= 6:
             try:
                 rows.append({
                     "time": float(p[0]),
-                    "lon":  float(p[3]),
-                    "lat":  float(p[4]),
-                    "hgt":  float(p[5]),
+                    "lon": float(p[3]),
+                    "lat": float(p[4]),
+                    "hgt": float(p[5])
                 })
-            except ValueError:
-                pass
+            except (ValueError, IndexError):
+                continue
+    
     return pd.DataFrame(rows)
 
 # ============================================================
-# LOAD STATIONS
+# LOAD STATIONS FROM GOOGLE DRIVE
 # ============================================================
 def load_stations():
-    url = get_gdrive_download_url(GDRIVE_STATIONS_FILE)
-    r = requests.get(url, timeout=20)
-    r.raise_for_status()
-
-    stations = pd.read_csv(
-        io.StringIO(r.text),
-        sep=r"\s+",
-        header=None,
-        names=["id", "lon", "lat", "hgt"],
-        dtype={"id": str},
-    )
-    stations["id"] = stations["id"].str.upper()
-    print(f"✅ Loaded {len(stations)} stations")
-    return stations
+    """Carrega a lista de estações do Google Drive."""
+    try:
+        url = get_gdrive_download_url(GDRIVE_STATIONS_FILE)
+        
+        response = requests.get(url, timeout=15)
+        response.raise_for_status()
+        
+        # Lê como CSV
+        stations = pd.read_csv(
+            io.StringIO(response.text),
+            sep=r"\s+",
+            header=None,
+            names=["id", "lon", "lat", "hgt"],
+            dtype={"id": str}
+        )
+        stations["id"] = stations["id"].str.upper()
+        
+        print(f"✅ Loaded {len(stations)} stations from Google Drive")
+        return stations
+        
+    except Exception as e:
+        print(f"❌ Erro ao carregar estações: {e}")
+        
+        # Fallback
+        return pd.DataFrame({
+            "id": ["ERROR"],
+            "lon": [-84.0],
+            "lat": [44.0],
+            "hgt": [200.0]
+        })
 
 stations = load_stations()
 
-# ============================================================
-# LOAD FILE INDEX (OBRIGATÓRIO)
-# ============================================================
-if not os.path.exists(FILE_INDEX_PATH):
-    raise RuntimeError("❌ file_index.json NOT FOUND – app cannot start")
+# Cache global para file IDs
+file_index = {"linear": {}, "cm": {}, "cf": {}}
+index_loaded = {"linear": False, "cm": False, "cf": False}
 
-with open(FILE_INDEX_PATH) as f:
-    file_index = json.load(f)
-
-print("✅ file_index.json loaded")
+# Tenta carregar índice pre-gerado (se existir)
+try:
+    if os.path.exists("file_index.json"):
+        with open("file_index.json") as f:
+            file_index = json.load(f)
+            for source in file_index:
+                index_loaded[source] = True
+            print("✅ Loaded file index from file_index.json")
+except:
+    pass
 
 # ============================================================
 # GNSS UTILITIES
 # ============================================================
 def read_pfile_from_gdrive(source, station):
-    source = source.lower()
-    station = station.upper()
-
-    if source not in file_index:
-        return pd.DataFrame()
-
-    if station not in file_index[source]:
-        return pd.DataFrame()
-
-    url = file_index[source][station]
-
+    """Lê arquivo .pfiles do Google Drive."""
+    folder_id = GDRIVE_FOLDERS[source]
+    
+    # Se ainda não carregou o índice desta pasta, tenta carregar
+    if not index_loaded[source]:
+        print(f"Loading index for {source}...")
+        file_index[source] = get_gdrive_file_list_via_api(folder_id)
+        index_loaded[source] = True
+        print(f"Found {len(file_index[source])} files in {source}")
+    
+    # Procura o file ID
+    file_id = file_index[source].get(station)
+    
+    if file_id is None:
+        print(f"File ID not found for {station} in {source}")
+        return pd.DataFrame(columns=["time", "lon", "lat", "hgt"])
+    
     try:
-        r = requests.get(url, timeout=30)
-        r.raise_for_status()
-        return parse_pfile_content(r.text)
+        url = get_gdrive_download_url(file_id)
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        
+        return parse_pfile_content(response.text)
+        
     except Exception as e:
-        print(f"❌ Error downloading {station} ({source}): {e}")
-        return pd.DataFrame()
+        print(f"Error downloading {station}: {e}")
+        return pd.DataFrame(columns=["time", "lon", "lat", "hgt"])
 
 def lonlat2local_mm(lon, lat, hgt):
     E, N = [], []
     for lo, la in zip(lon, lat):
         cm = int(lo / 3) * 3
         proj = Proj(
-            proj="tmerc",
-            lon_0=cm,
-            lat_0=0,
-            k=0.9999,
-            x_0=250000,
-            ellps="WGS84",
-            units="m",
+            proj="tmerc", lon_0=cm, lat_0=0,
+            k=0.9999, x_0=250000,
+            ellps="WGS84", units="m"
         )
         e, n = proj(lo, la)
         E.append(e)
@@ -142,7 +222,7 @@ def seasonal_model(x, t, remove_trend=False):
         np.sin(2*np.pi*t),
         np.cos(2*np.pi*t),
         np.sin(4*np.pi*t),
-        np.cos(4*np.pi*t),
+        np.cos(4*np.pi*t)
     ])
     m, _, _, _ = lstsq(G, x)
     if remove_trend:
@@ -153,8 +233,8 @@ def seasonal_model(x, t, remove_trend=False):
 # DASH APP
 # ============================================================
 app = dash.Dash(__name__)
-server = app.server
 app.title = "GNSS Great Lakes Viewer"
+server = app.server
 
 # ============================================================
 # MAP
@@ -168,16 +248,16 @@ def make_map(show_labels=False):
         text=stations.id if show_labels else None,
         mode="markers+text" if show_labels else "markers",
         marker=dict(size=8, color="crimson"),
-        hovertemplate="Station: %{customdata}<extra></extra>",
+        hovertemplate="Station: %{customdata}<extra></extra>"
     )
     fig.update_layout(
         mapbox=dict(
             style="open-street-map",
             center=dict(lon=-84, lat=44),
-            zoom=4.2,
+            zoom=4.2
         ),
         height=650,
-        margin=dict(l=20, r=20, t=40, b=20),
+        margin=dict(l=20, r=20, t=40, b=20)
     )
     return fig
 
@@ -187,29 +267,46 @@ def make_map(show_labels=False):
 app.layout = html.Div(
     style={"width": "1200px", "margin": "auto"},
     children=[
-        dcc.Store(
-            id="ui-state",
-            data=dict(station=None, source="linear", view="original", model=True),
-        ),
-        html.H2("MSU Geodesy Lab – Great Lakes GNSS Stations"),
+
+        dcc.Store(id="ui-state", data={
+            "station": None,
+            "source": "linear",
+            "view": "original",
+            "model": True
+        }),
+
+        html.H2("MSU Geodesy Lab - The Great Lakes GNSS Stations"),
+        
+        html.Div([
+            html.P("⚠️ Note: Due to Google Drive limitations, file loading may be slow or fail. If data doesn't load, please try another station or source.", 
+                   style={"fontSize": "12px", "color": "#666", "fontStyle": "italic"})
+        ]),
+
         dcc.Graph(id="station-map", figure=make_map(), config={"scrollZoom": True}),
         html.Button("Show IDs", id="btn-labels"),
+
         html.Hr(),
+
         html.Div([
-            html.Button("Linear", id="src-linear"),
-            html.Button("CM", id="src-cm"),
-            html.Button("CF", id="src-cf"),
-        ]),
-        html.Div([
-            html.Button("Original", id="btn-original"),
-            html.Button("Detrended", id="btn-detrended"),
-        ]),
-        html.Div([
-            html.Button("Model ON", id="btn-model-on"),
-            html.Button("Model OFF", id="btn-model-off"),
-        ]),
-        html.Div(id="timeseries-container"),
-    ],
+            html.Div([
+                html.Button("Linear", id="src-linear"),
+                html.Button("CM", id="src-cm"),
+                html.Button("CF", id="src-cf"),
+            ], style={"marginBottom": "10px"}),
+
+            html.Div([
+                html.Button("Original", id="btn-original"),
+                html.Button("Detrended", id="btn-detrended"),
+            ], style={"marginBottom": "10px"}),
+
+            html.Div([
+                html.Button("Model ON", id="btn-model-on"),
+                html.Button("Model OFF", id="btn-model-off"),
+            ]),
+        ], style={"marginBottom": "20px"}),
+
+        html.Div(id="timeseries-container")
+    ]
 )
 
 # ============================================================
@@ -217,10 +314,11 @@ app.layout = html.Div(
 # ============================================================
 @app.callback(
     Output("station-map", "figure"),
-    Input("btn-labels", "n_clicks"),
+    Input("btn-labels", "n_clicks")
 )
-def toggle_station_labels(n):
-    return make_map(show_labels=(n or 0) % 2 == 1)
+def toggle_station_labels(n_clicks):
+    show = (n_clicks or 0) % 2 == 1
+    return make_map(show_labels=show)
 
 @app.callback(
     Output("ui-state", "data"),
@@ -235,7 +333,7 @@ def toggle_station_labels(n):
         Input("btn-model-off", "n_clicks"),
     ],
     State("ui-state", "data"),
-    prevent_initial_call=True,
+    prevent_initial_call=True
 )
 def update_state(*args):
     ctx = dash.callback_context
@@ -260,30 +358,100 @@ def update_state(*args):
     return state
 
 # ============================================================
-# RENDER TS
+# RENDER TIMESERIES
 # ============================================================
 @app.callback(
     Output("timeseries-container", "children"),
-    Input("ui-state", "data"),
+    Input("ui-state", "data")
 )
 def render_ts(state):
+
     if state["station"] is None:
-        return html.Div("Click on a station")
+        return html.Div("Click on a station to view its time series.")
 
-    df = read_pfile_from_gdrive(state["source"], state["station"])
-    if df.empty:
-        return html.Div("No data available")
+    try:
+        df = read_pfile_from_gdrive(state["source"], state["station"])
+        
+        if df.empty:
+            return html.Div([
+                html.H3(f"Could not load data for station {state['station']}"),
+                html.P("Possible reasons:"),
+                html.Ul([
+                    html.Li("File not found in the selected source (Linear/CM/CF)"),
+                    html.Li("Google Drive temporarily blocking automated access"),
+                    html.Li("Station ID mismatch between map and data files")
+                ]),
+                html.P("Try:"),
+                html.Ul([
+                    html.Li("Selecting a different source (Linear/CM/CF buttons above)"),
+                    html.Li("Clicking on a different station"),
+                    html.Li("Waiting a moment and trying again")
+                ])
+            ])
+        
+        t = df.time.values
+        E, N, U = lonlat2local_mm(df.lon, df.lat, df.hgt)
 
-    t = df.time.values
-    E, N, U = lonlat2local_mm(df.lon, df.lat, df.hgt)
+        E_tr, vE = trend_and_velocity(E, t)
+        N_tr, vN = trend_and_velocity(N, t)
+        U_tr, vU = trend_and_velocity(U, t)
 
-    fig = make_subplots(rows=3, cols=1, shared_xaxes=True)
-    fig.add_scatter(x=t, y=E, mode="markers", row=1, col=1)
-    fig.add_scatter(x=t, y=N, mode="markers", row=2, col=1)
-    fig.add_scatter(x=t, y=U, mode="markers", row=3, col=1)
+        E_d, N_d, U_d = E - E_tr, N - N_tr, U - U_tr
 
-    fig.update_layout(height=900, showlegend=False)
-    return dcc.Graph(figure=fig)
+        E_m = seasonal_model(E, t)
+        N_m = seasonal_model(N, t)
+        U_m = seasonal_model(U, t)
+
+        E_md = seasonal_model(E_d, t, True)
+        N_md = seasonal_model(N_d, t, True)
+        U_md = seasonal_model(U_d, t, True)
+
+        hover = (
+            "Year: %{x:.4f}<br>"
+            "Disp: %{y:.2f} mm"
+            "<extra></extra>"
+        )
+
+        fig = make_subplots(
+            rows=3, cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.035,
+            subplot_titles=[
+                f"East ({vE:.2f} mm/yr)",
+                f"North ({vN:.2f} mm/yr)",
+                f"Up ({vU:.2f} mm/yr)"
+            ]
+        )
+
+        use_detr = state["view"] == "detrended"
+
+        fig.add_scatter(x=t, y=E_d if use_detr else E, mode="markers", hovertemplate=hover, row=1, col=1)
+        fig.add_scatter(x=t, y=N_d if use_detr else N, mode="markers", hovertemplate=hover, row=2, col=1)
+        fig.add_scatter(x=t, y=U_d if use_detr else U, mode="markers", hovertemplate=hover, row=3, col=1)
+
+        if state["model"]:
+            fig.add_scatter(x=t, y=E_md if use_detr else E_m, mode="lines",
+                            line=dict(color="red"), hoverinfo="skip", row=1, col=1)
+            fig.add_scatter(x=t, y=N_md if use_detr else N_m, mode="lines",
+                            line=dict(color="red"), hoverinfo="skip", row=2, col=1)
+            fig.add_scatter(x=t, y=U_md if use_detr else U_m, mode="lines",
+                            line=dict(color="red"), hoverinfo="skip", row=3, col=1)
+
+        fig.update_layout(
+            title=f"Station {state['station']} — {state['source'].upper()}",
+            height=900,
+            showlegend=False
+        )
+
+        return dcc.Graph(figure=fig, config={"scrollZoom": True})
+        
+    except Exception as e:
+        import traceback
+        return html.Div([
+            html.H3(f"Error loading data for station {state['station']}"),
+            html.P(f"Error: {str(e)}"),
+            html.Pre(traceback.format_exc(), style={"fontSize": "10px", "overflow": "auto"})
+        ])
 
 # ============================================================
 # RUN
