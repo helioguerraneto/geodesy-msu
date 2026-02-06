@@ -21,13 +21,6 @@ from plotly.subplots import make_subplots
 PORT = int(os.environ.get("PORT", 8050))
 MM = 1000.0
 
-# Google Drive folder IDs extracted from share links
-GDRIVE_FOLDERS = {
-    "linear": "1UQdyJahGg1gxb2WSUFs1ge9wUYUPXq93",
-    "cm": "1Xdcp8j4m4VjOwDe3ryOdNm3ge2aVqmLf",
-    "cf": "1Sc8g2GdEodO7NAeDZWkbM1MlbFNA_T5y",
-}
-
 GDRIVE_STATIONS_FILE = "17mi5FA44LvnWr-50-bLgrdbrBsuMU-bK"
 
 # ============================================================
@@ -38,41 +31,6 @@ def get_gdrive_download_url(file_id):
     Converte ID do arquivo Google Drive para URL de download direto.
     """
     return f"https://drive.google.com/uc?export=download&id={file_id}"
-
-def list_files_in_gdrive_folder(folder_id):
-    """
-    Lista arquivos em uma pasta pública do Google Drive usando web scraping.
-    Retorna dicionário {filename: file_id}
-    """
-    try:
-        import re
-        
-        # Acessa a página da pasta
-        url = f"https://drive.google.com/drive/folders/{folder_id}"
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-        
-        response = requests.get(url, headers=headers, timeout=30)
-        
-        if response.status_code != 200:
-            return {}
-        
-        # Procura por padrões de file IDs no HTML
-        # Google Drive usa um formato específico para file IDs
-        pattern = r'"([a-zA-Z0-9_-]{25,})".*?"([^"]+\.pfiles)"'
-        matches = re.findall(pattern, response.text)
-        
-        files = {}
-        for file_id, filename in matches:
-            station_id = filename.replace('.pfiles', '')
-            files[station_id] = file_id
-        
-        return files
-        
-    except Exception as e:
-        print(f"Erro ao listar pasta {folder_id}: {e}")
-        return {}
 
 def parse_pfile_content(content):
     """
@@ -140,46 +98,37 @@ file_index = {"linear": {}, "cm": {}, "cf": {}}
 index_loaded = {"linear": False, "cm": False, "cf": False}
 
 # Tenta carregar índice pre-gerado (se existir)
-try:
-    if os.path.exists("file_index.json"):
-        with open("file_index.json") as f:
-            file_index = json.load(f)
-            for source in file_index:
-                index_loaded[source] = True
-            print("✅ Loaded file index from file_index.json")
-except:
-    pass
+if os.path.exists("file_index.json"):
+    with open("file_index.json") as f:
+        file_index = json.load(f)
+    print("✅ Loaded file index from file_index.json")
+else:
+    raise RuntimeError("❌ file_index.json NOT FOUND – app cannot start")
 
 # ============================================================
 # GNSS UTILITIES
 # ============================================================
 def read_pfile_from_gdrive(source, station):
     """
-    Lê arquivo .pfiles do Google Drive.
+    Lê arquivo .pfiles usando SOMENTE file_index.json
     """
-    folder_id = GDRIVE_FOLDERS[source]
-    
-    # Se ainda não carregou o índice desta pasta, tenta carregar
-    if not index_loaded[source]:
-        print(f"Loading index for {source}...")
-        file_index[source] = list_files_in_gdrive_folder(folder_id)
-        index_loaded[source] = True
-        print(f"Found {len(file_index[source])} files in {source}")
-    
-    # Procura o file ID
-    file_id = file_index[source].get(station)
-    
-    if file_id is None:
-        print(f"File ID not found for {station} in {source}")
+    if source not in file_index:
+        print(f"Source {source} not in file_index")
         return pd.DataFrame(columns=["time", "lon", "lat", "hgt"])
-    
+
+    station = station.upper()
+
+    if station not in file_index[source]:
+        print(f"{station} not found in {source}")
+        return pd.DataFrame(columns=["time", "lon", "lat", "hgt"])
+
+    url = file_index[source][station]
+
     try:
-        url = get_gdrive_download_url(file_id)
         response = requests.get(url, timeout=30)
         response.raise_for_status()
-        
         return parse_pfile_content(response.text)
-        
+
     except Exception as e:
         print(f"Error downloading {station}: {e}")
         return pd.DataFrame(columns=["time", "lon", "lat", "hgt"])
