@@ -438,11 +438,11 @@ def render_ts(state):
 
         if state["model"]:
             fig.add_scatter(x=t, y=E_md if use_detr else E_m, mode="lines",
-                            line=dict(color="red"), hoverinfo="skip", row=1, col=1)
+                            line=dict(color="magenta"), hoverinfo="skip", row=1, col=1)
             fig.add_scatter(x=t, y=N_md if use_detr else N_m, mode="lines",
-                            line=dict(color="red"), hoverinfo="skip", row=2, col=1)
+                            line=dict(color="magenta"), hoverinfo="skip", row=2, col=1)
             fig.add_scatter(x=t, y=U_md if use_detr else U_m, mode="lines",
-                            line=dict(color="red"), hoverinfo="skip", row=3, col=1)
+                            line=dict(color="magenta"), hoverinfo="skip", row=3, col=1)
 
         fig.update_layout(
             title=f"Station {state['station']} — {state['source'].upper()}",
