@@ -9,10 +9,14 @@ import numpy as np
 import pandas as pd
 from scipy.linalg import lstsq
 from pyproj import Proj
+import re
+
+
 import dash
 from dash import dcc, html, Input, Output, State
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+
 from functools import lru_cache
 
 # ============================================================
@@ -20,6 +24,13 @@ from functools import lru_cache
 # ============================================================
 PORT = int(os.environ.get("PORT", 8050))
 MM = 1000.0
+
+# Google Drive folder IDs extracted from share links
+GDRIVE_FOLDERS = {
+    "linear": "1UQdyJahGg1gxb2WSUFs1ge9wUYUPXq93",
+    "cm": "1Xdcp8j4m4VjOwDe3ryOdNm3ge2aVqmLf",
+    "cf": "1Sc8g2GdEodO7NAeDZWkbM1MlbFNA_T5y",
+}
 
 GDRIVE_STATIONS_FILE = "17mi5FA44LvnWr-50-bLgrdbrBsuMU-bK"
 
@@ -29,6 +40,56 @@ GDRIVE_STATIONS_FILE = "17mi5FA44LvnWr-50-bLgrdbrBsuMU-bK"
 def get_gdrive_download_url(file_id):
     """Converte ID do arquivo Google Drive para URL de download direto."""
     return f"https://drive.google.com/uc?export=download&id={file_id}"
+
+def get_gdrive_file_list_via_api(folder_id):
+    """
+    Tenta listar arquivos usando a API pública do Google Drive (sem auth).
+    Isso funciona para pastas públicas.
+    """
+    try:
+        # Usa a API v3 do Google Drive sem autenticação (apenas para pastas públicas)
+        # Formato: https://www.googleapis.com/drive/v3/files?q='FOLDER_ID'+in+parents&fields=files(id,name)&key=API_KEY
+        # Como não temos API key, vamos tentar uma abordagem diferente
+        
+        # Tenta acessar via web scraping melhorado
+        url = f"https://drive.google.com/embeddedfolderview?id={folder_id}"
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        
+        response = requests.get(url, headers=headers, timeout=30)
+        
+        if response.status_code != 200:
+            return {}
+        
+        # Procura por IDs de arquivo no HTML da view embutida
+        # Formato: <a href="/file/d/FILE_ID/view
+        pattern = r'/file/d/([a-zA-Z0-9_-]+)/view[^>]*>([^<]+\.pfiles)'
+        matches = re.findall(pattern, response.text)
+        
+        files = {}
+        for file_id, filename in matches:
+            station_id = filename.replace('.pfiles', '').strip()
+            files[station_id] = file_id
+            
+        if len(files) > 0:
+            print(f"Found {len(files)} files via embedded view")
+            return files
+        
+        # Tenta outro padrão
+        pattern2 = r'"([a-zA-Z0-9_-]{25,})"[^}]*?"([^"]+\.pfiles)"'
+        matches2 = re.findall(pattern2, response.text)
+        
+        for file_id, filename in matches2:
+            station_id = filename.replace('.pfiles', '').strip()
+            if station_id not in files:
+                files[station_id] = file_id
+        
+        return files
+        
+    except Exception as e:
+        print(f"Error listing folder {folder_id}: {e}")
+        return {}
 
 def parse_pfile_content(content):
     """Parseia o conteúdo de um arquivo .pfiles."""
