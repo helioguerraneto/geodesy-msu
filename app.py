@@ -21,126 +21,105 @@ from plotly.subplots import make_subplots
 PORT = int(os.environ.get("PORT", 8050))
 MM = 1000.0
 
+# ID do arquivo glstations.txt no Google Drive
 GDRIVE_STATIONS_FILE = "17mi5FA44LvnWr-50-bLgrdbrBsuMU-bK"
 
+FILE_INDEX_PATH = "file_index.json"
+
 # ============================================================
-# GOOGLE DRIVE UTILITIES
+# GOOGLE DRIVE UTIL
 # ============================================================
 def get_gdrive_download_url(file_id):
-    """
-    Converte ID do arquivo Google Drive para URL de download direto.
-    """
     return f"https://drive.google.com/uc?export=download&id={file_id}"
 
+# ============================================================
+# PARSE PFILES
+# ============================================================
 def parse_pfile_content(content):
-    """
-    Parseia o conteúdo de um arquivo .pfiles.
-    """
     rows = []
-    for line in content.split('\n'):
-        if line.startswith("#") or not line.strip():
+    for line in content.splitlines():
+        if not line.strip() or line.startswith("#"):
             continue
         p = line.split()
         if len(p) >= 6:
             try:
                 rows.append({
                     "time": float(p[0]),
-                    "lon": float(p[3]),
-                    "lat": float(p[4]),
-                    "hgt": float(p[5])
+                    "lon":  float(p[3]),
+                    "lat":  float(p[4]),
+                    "hgt":  float(p[5]),
                 })
-            except (ValueError, IndexError):
-                continue
-    
+            except ValueError:
+                pass
     return pd.DataFrame(rows)
 
 # ============================================================
-# LOAD STATIONS FROM GOOGLE DRIVE
+# LOAD STATIONS
 # ============================================================
 def load_stations():
-    """
-    Carrega a lista de estações do Google Drive.
-    """
-    try:
-        url = get_gdrive_download_url(GDRIVE_STATIONS_FILE)
-        
-        response = requests.get(url, timeout=15)
-        response.raise_for_status()
-        
-        # Lê como CSV
-        stations = pd.read_csv(
-            io.StringIO(response.text),
-            sep=r"\s+",
-            header=None,
-            names=["id", "lon", "lat", "hgt"],
-            dtype={"id": str}
-        )
-        stations["id"] = stations["id"].str.upper()
-        
-        print(f"✅ Loaded {len(stations)} stations from Google Drive")
-        return stations
-        
-    except Exception as e:
-        print(f"❌ Erro ao carregar estações: {e}")
-        
-        # Fallback: retorna dados de exemplo
-        return pd.DataFrame({
-            "id": ["ERROR"],
-            "lon": [-84.0],
-            "lat": [44.0],
-            "hgt": [200.0]
-        })
+    url = get_gdrive_download_url(GDRIVE_STATIONS_FILE)
+    r = requests.get(url, timeout=20)
+    r.raise_for_status()
+
+    stations = pd.read_csv(
+        io.StringIO(r.text),
+        sep=r"\s+",
+        header=None,
+        names=["id", "lon", "lat", "hgt"],
+        dtype={"id": str},
+    )
+    stations["id"] = stations["id"].str.upper()
+    print(f"✅ Loaded {len(stations)} stations")
+    return stations
 
 stations = load_stations()
 
-# Cache global para file IDs
-file_index = {"linear": {}, "cm": {}, "cf": {}}
-index_loaded = {"linear": False, "cm": False, "cf": False}
-
-# Tenta carregar índice pre-gerado (se existir)
-if os.path.exists("file_index.json"):
-    with open("file_index.json") as f:
-        file_index = json.load(f)
-    print("✅ Loaded file index from file_index.json")
-else:
+# ============================================================
+# LOAD FILE INDEX (OBRIGATÓRIO)
+# ============================================================
+if not os.path.exists(FILE_INDEX_PATH):
     raise RuntimeError("❌ file_index.json NOT FOUND – app cannot start")
+
+with open(FILE_INDEX_PATH) as f:
+    file_index = json.load(f)
+
+print("✅ file_index.json loaded")
 
 # ============================================================
 # GNSS UTILITIES
 # ============================================================
 def read_pfile_from_gdrive(source, station):
-    """
-    Lê arquivo .pfiles usando SOMENTE file_index.json
-    """
-    if source not in file_index:
-        print(f"Source {source} not in file_index")
-        return pd.DataFrame(columns=["time", "lon", "lat", "hgt"])
-
+    source = source.lower()
     station = station.upper()
 
+    if source not in file_index:
+        return pd.DataFrame()
+
     if station not in file_index[source]:
-        print(f"{station} not found in {source}")
-        return pd.DataFrame(columns=["time", "lon", "lat", "hgt"])
+        return pd.DataFrame()
 
     url = file_index[source][station]
 
     try:
-        response = requests.get(url, timeout=30)
-        response.raise_for_status()
-        return parse_pfile_content(response.text)
-
+        r = requests.get(url, timeout=30)
+        r.raise_for_status()
+        return parse_pfile_content(r.text)
     except Exception as e:
-        print(f"Error downloading {station}: {e}")
-        return pd.DataFrame(columns=["time", "lon", "lat", "hgt"])
+        print(f"❌ Error downloading {station} ({source}): {e}")
+        return pd.DataFrame()
 
 def lonlat2local_mm(lon, lat, hgt):
     E, N = [], []
     for lo, la in zip(lon, lat):
         cm = int(lo / 3) * 3
         proj = Proj(
-            proj="tmerc", lon_0=cm, lat_0=0,
-            k=0.9999, x_0=250000,
-            ellps="WGS84", units="m"
+            proj="tmerc",
+            lon_0=cm,
+            lat_0=0,
+            k=0.9999,
+            x_0=250000,
+            ellps="WGS84",
+            units="m",
         )
         e, n = proj(lo, la)
         E.append(e)
@@ -163,7 +142,7 @@ def seasonal_model(x, t, remove_trend=False):
         np.sin(2*np.pi*t),
         np.cos(2*np.pi*t),
         np.sin(4*np.pi*t),
-        np.cos(4*np.pi*t)
+        np.cos(4*np.pi*t),
     ])
     m, _, _, _ = lstsq(G, x)
     if remove_trend:
@@ -174,8 +153,8 @@ def seasonal_model(x, t, remove_trend=False):
 # DASH APP
 # ============================================================
 app = dash.Dash(__name__)
+server = app.server
 app.title = "GNSS Great Lakes Viewer"
-server = app.server  # Necessário para o Render
 
 # ============================================================
 # MAP
@@ -189,16 +168,16 @@ def make_map(show_labels=False):
         text=stations.id if show_labels else None,
         mode="markers+text" if show_labels else "markers",
         marker=dict(size=8, color="crimson"),
-        hovertemplate="Station: %{customdata}<extra></extra>"
+        hovertemplate="Station: %{customdata}<extra></extra>",
     )
     fig.update_layout(
         mapbox=dict(
             style="open-street-map",
             center=dict(lon=-84, lat=44),
-            zoom=4.2
+            zoom=4.2,
         ),
         height=650,
-        margin=dict(l=20, r=20, t=40, b=20)
+        margin=dict(l=20, r=20, t=40, b=20),
     )
     return fig
 
@@ -208,41 +187,29 @@ def make_map(show_labels=False):
 app.layout = html.Div(
     style={"width": "1200px", "margin": "auto"},
     children=[
-
-        dcc.Store(id="ui-state", data={
-            "station": None,
-            "source": "linear",
-            "view": "original",
-            "model": True
-        }),
-
-        html.H2("MSU Geodesy Lab - The Great Lakes GNSS Stations"),
-
+        dcc.Store(
+            id="ui-state",
+            data=dict(station=None, source="linear", view="original", model=True),
+        ),
+        html.H2("MSU Geodesy Lab – Great Lakes GNSS Stations"),
         dcc.Graph(id="station-map", figure=make_map(), config={"scrollZoom": True}),
         html.Button("Show IDs", id="btn-labels"),
-
         html.Hr(),
-
         html.Div([
-            html.Div([
-                html.Button("Linear", id="src-linear"),
-                html.Button("CM", id="src-cm"),
-                html.Button("CF", id="src-cf"),
-            ], style={"marginBottom": "10px"}),
-
-            html.Div([
-                html.Button("Original", id="btn-original"),
-                html.Button("Detrended", id="btn-detrended"),
-            ], style={"marginBottom": "10px"}),
-
-            html.Div([
-                html.Button("Model ON", id="btn-model-on"),
-                html.Button("Model OFF", id="btn-model-off"),
-            ]),
-        ], style={"marginBottom": "20px"}),
-
-        html.Div(id="timeseries-container")
-    ]
+            html.Button("Linear", id="src-linear"),
+            html.Button("CM", id="src-cm"),
+            html.Button("CF", id="src-cf"),
+        ]),
+        html.Div([
+            html.Button("Original", id="btn-original"),
+            html.Button("Detrended", id="btn-detrended"),
+        ]),
+        html.Div([
+            html.Button("Model ON", id="btn-model-on"),
+            html.Button("Model OFF", id="btn-model-off"),
+        ]),
+        html.Div(id="timeseries-container"),
+    ],
 )
 
 # ============================================================
@@ -250,11 +217,10 @@ app.layout = html.Div(
 # ============================================================
 @app.callback(
     Output("station-map", "figure"),
-    Input("btn-labels", "n_clicks")
+    Input("btn-labels", "n_clicks"),
 )
-def toggle_station_labels(n_clicks):
-    show = (n_clicks or 0) % 2 == 1
-    return make_map(show_labels=show)
+def toggle_station_labels(n):
+    return make_map(show_labels=(n or 0) % 2 == 1)
 
 @app.callback(
     Output("ui-state", "data"),
@@ -269,7 +235,7 @@ def toggle_station_labels(n_clicks):
         Input("btn-model-off", "n_clicks"),
     ],
     State("ui-state", "data"),
-    prevent_initial_call=True
+    prevent_initial_call=True,
 )
 def update_state(*args):
     ctx = dash.callback_context
@@ -294,90 +260,30 @@ def update_state(*args):
     return state
 
 # ============================================================
-# RENDER TIMESERIES
+# RENDER TS
 # ============================================================
 @app.callback(
     Output("timeseries-container", "children"),
-    Input("ui-state", "data")
+    Input("ui-state", "data"),
 )
 def render_ts(state):
-
     if state["station"] is None:
-        return html.Div("Click on a station to view its time series.")
+        return html.Div("Click on a station")
 
-    try:
-        df = read_pfile_from_gdrive(state["source"], state["station"])
-        
-        if df.empty:
-            return html.Div([
-                html.H3(f"Could not load data for station {state['station']}"),
-                html.P("The file might not be available in the selected source."),
-                html.P("Try selecting a different source (Linear/CM/CF).")
-            ])
-        
-        t = df.time.values
-        E, N, U = lonlat2local_mm(df.lon, df.lat, df.hgt)
+    df = read_pfile_from_gdrive(state["source"], state["station"])
+    if df.empty:
+        return html.Div("No data available")
 
-        E_tr, vE = trend_and_velocity(E, t)
-        N_tr, vN = trend_and_velocity(N, t)
-        U_tr, vU = trend_and_velocity(U, t)
+    t = df.time.values
+    E, N, U = lonlat2local_mm(df.lon, df.lat, df.hgt)
 
-        E_d, N_d, U_d = E - E_tr, N - N_tr, U - U_tr
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True)
+    fig.add_scatter(x=t, y=E, mode="markers", row=1, col=1)
+    fig.add_scatter(x=t, y=N, mode="markers", row=2, col=1)
+    fig.add_scatter(x=t, y=U, mode="markers", row=3, col=1)
 
-        E_m = seasonal_model(E, t)
-        N_m = seasonal_model(N, t)
-        U_m = seasonal_model(U, t)
-
-        E_md = seasonal_model(E_d, t, True)
-        N_md = seasonal_model(N_d, t, True)
-        U_md = seasonal_model(U_d, t, True)
-
-        hover = (
-            "Year: %{x:.4f}<br>"
-            "Disp: %{y:.2f} mm"
-            "<extra></extra>"
-        )
-
-        fig = make_subplots(
-            rows=3, cols=1,
-            shared_xaxes=True,
-            vertical_spacing=0.035,
-            subplot_titles=[
-                f"East ({vE:.2f} mm/yr)",
-                f"North ({vN:.2f} mm/yr)",
-                f"Up ({vU:.2f} mm/yr)"
-            ]
-        )
-
-        use_detr = state["view"] == "detrended"
-
-        fig.add_scatter(x=t, y=E_d if use_detr else E, mode="markers", hovertemplate=hover, row=1, col=1)
-        fig.add_scatter(x=t, y=N_d if use_detr else N, mode="markers", hovertemplate=hover, row=2, col=1)
-        fig.add_scatter(x=t, y=U_d if use_detr else U, mode="markers", hovertemplate=hover, row=3, col=1)
-
-        if state["model"]:
-            fig.add_scatter(x=t, y=E_md if use_detr else E_m, mode="lines",
-                            line=dict(color="red"), hoverinfo="skip", row=1, col=1)
-            fig.add_scatter(x=t, y=N_md if use_detr else N_m, mode="lines",
-                            line=dict(color="red"), hoverinfo="skip", row=2, col=1)
-            fig.add_scatter(x=t, y=U_md if use_detr else U_m, mode="lines",
-                            line=dict(color="red"), hoverinfo="skip", row=3, col=1)
-
-        fig.update_layout(
-            title=f"Station {state['station']} — {state['source'].upper()}",
-            height=900,
-            showlegend=False
-        )
-
-        return dcc.Graph(figure=fig, config={"scrollZoom": True})
-        
-    except Exception as e:
-        import traceback
-        return html.Div([
-            html.H3(f"Error loading data for station {state['station']}"),
-            html.P(f"Error: {str(e)}"),
-            html.Pre(traceback.format_exc(), style={"fontSize": "10px", "overflow": "auto"})
-        ])
+    fig.update_layout(height=900, showlegend=False)
+    return dcc.Graph(figure=fig)
 
 # ============================================================
 # RUN
