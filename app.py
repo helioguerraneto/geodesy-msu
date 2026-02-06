@@ -174,15 +174,22 @@ def read_pfile_from_gdrive(source, station):
         index_loaded[source] = True
         print(f"Found {len(file_index[source])} files in {source}")
     
-    # Procura o file ID
-    file_id = file_index[source].get(station)
+    # Procura o file ID ou URL
+    file_ref = file_index[source].get(station)
     
-    if file_id is None:
-        print(f"File ID not found for {station} in {source}")
+    if file_ref is None:
+        print(f"File not found for {station} in {source}")
         return pd.DataFrame(columns=["time", "lon", "lat", "hgt"])
     
     try:
-        url = get_gdrive_download_url(file_id)
+        # Se file_ref já é uma URL completa, usa direto
+        # Senão, converte file ID para URL
+        if file_ref.startswith("http"):
+            url = file_ref
+        else:
+            url = get_gdrive_download_url(file_ref)
+        
+        print(f"Downloading {station} from {source}...")
         response = requests.get(url, timeout=30)
         response.raise_for_status()
         
